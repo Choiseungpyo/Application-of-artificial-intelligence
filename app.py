@@ -258,6 +258,8 @@ KOREAN_KEYWORD_MAP = {
     "캐릭터 창": "gameplay_panel",
     "스킬 창": "gameplay_panel",
     "패널 화면": "gameplay_panel",
+    "장비 화면": "equipment",
+    "장비창": "equipment",
     "판타지": "fantasy",
     "중세": "medieval",
     "현대": "modern",

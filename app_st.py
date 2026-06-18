@@ -397,19 +397,9 @@ def _calibrated_card_score(result, mode, is_image=False):
         raw *= 100.0
     
     if is_image:
-        # 이미지 검색은 Base 유사도가 이미 50~85점으로 꽤 높게 나옴
-        if mode == "base":
-            boosted = raw * 1.3
-            return max(0.0, min(99.9, boosted))
-        # Guided Search는 보너스가 약간 붙어서 나오므로 살짝 보정
         boosted = raw + 10.0
         return max(0.0, min(99.9, boosted))
     else:
-        # 텍스트 검색은 Base 유사도가 10~25점으로 매우 낮음
-        if mode == "base":
-            boosted = raw * 2.5
-            return max(0.0, min(99.9, boosted))
-        # Guided Search(Fine-tuned) 텍스트 쿼리는 35점 고정 보정
         boosted = raw + 35.0
         return max(0.0, min(99.9, boosted))
 
@@ -431,39 +421,58 @@ def render_result_card(res, is_base=False, is_image=False):
     
     img_src = get_image_base64(img_path)
     
-    ps = res.get("primary_screen_type", "-")
+    ps = res.get("primary_screen_type", "")
+    if str(ps).lower() in ["unknown", "-"]:
+        ps = ""
+        
     styles = res.get("visual_style_tags", [])
     themes = res.get("theme_tags", [])
     
-    styles_str = ", ".join(styles) if isinstance(styles, list) else str(styles)
-    themes_str = ", ".join(themes) if isinstance(themes, list) else str(themes)
-    if not styles_str: styles_str = "-"
-    if not themes_str: themes_str = "-"
+    # Filter out Unknown tags
+    styles = [s for s in (styles if isinstance(styles, list) else [styles]) if s and str(s).lower() not in ["unknown", "-"]]
+    themes = [t for t in (themes if isinstance(themes, list) else [themes]) if t and str(t).lower() not in ["unknown", "-"]]
+    
+    styles_str = ", ".join(styles) if styles else ""
+    themes_str = ", ".join(themes) if themes else ""
 
     if not is_base:
          score_html = f'<div class="result-score">매칭 점수: {score_text} <span style="font-size:11px;">{level}</span></div>'
     else:
          score_html = f'<div class="result-score">유사도: {score_text} <span style="font-size:11px;">{level}</span></div>'
 
+    primary_match = res.get("primary_match", False)
+    matched_styles = res.get("matched_visual_style_tags", [])
+    matched_themes = res.get("matched_theme_tags", [])
+
+    def format_tag(tag, is_matched):
+        if is_matched:
+            return f'<span class="result-tag-val" style="background:#eff6ff; color:#1d4ed8; border:1px solid #bfdbfe; font-weight:800;">{tag} ✨</span>'
+        return f'<span class="result-tag-val">{tag}</span>'
+
+    # Build tag groups dynamically
+    tags_html = ""
+    if ps:
+        tags_html += f'<div class="result-tag-group"><span class="result-tag-label">유형</span><div style="display:flex; flex-wrap:wrap; gap:4px;">{format_tag(ps, primary_match)}</div></div>'
+            
+    if styles:
+        style_spans = [format_tag(s, s in matched_styles) for s in styles]
+        tags_html += f'<div class="result-tag-group"><span class="result-tag-label">스타일</span><div style="display:flex; flex-wrap:wrap; gap:4px;">{"".join(style_spans)}</div></div>'
+
+    if themes:
+        theme_spans = [format_tag(t, t in matched_themes) for t in themes]
+        tags_html += f'<div class="result-tag-group"><span class="result-tag-label">테마</span><div style="display:flex; flex-wrap:wrap; gap:4px;">{"".join(theme_spans)}</div></div>'
     html = f"""
-    <div class="result-card">
-        <div style="height:180px; width:100%; overflow:hidden; background:#f1f5f9; display:flex; align-items:center; justify-content:center;">
-            <img src="{img_src}" style="max-width:100%; max-height:100%; object-fit:contain;" onerror="this.src='';">
-        </div>
-        <div class="result-card-content">
-            <div class="result-title" title="{title}">{title}</div>
-            <div class="result-tag-group">
-                <span class="result-tag-label">유형</span>
-                <span class="result-tag-val">{ps}</span>
-            </div>
-            <div class="result-tag-group">
-                <span class="result-tag-label">스타일/테마</span>
-                <span class="result-tag-val" style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:100%;">{styles_str} / {themes_str}</span>
-            </div>
-            {score_html}
-        </div>
+<div class="result-card">
+    <div style="height:180px; width:100%; overflow:hidden; background:#f1f5f9; display:flex; align-items:center; justify-content:center;">
+        <img src="{img_src}" style="max-width:100%; max-height:100%; object-fit:contain;" onerror="this.src='';">
     </div>
-    """
+    <div class="result-card-content">
+        <div class="result-title" title="{title}">{title}</div>
+        {tags_html}
+        {score_html}
+    </div>
+</div>
+"""
     return html
 
 LABEL_MAPPING = {
@@ -626,7 +635,19 @@ def render_search_page():
                         layout_roles=parsed.get("layout_roles", []),
                         top_k=int(num_results_txt),
                     )
-                    base_res = engine.search_by_text(query_text=text_query, top_k=int(num_results_txt))
+                    base_res = engine.search_by_text_guided(
+                        query_text=text_query,
+                        primary_screen_type=parsed.get("primary_screen_type", ""),
+                        visual_style_tags=parsed.get("visual_style_tags", []),
+                        theme_tags=parsed.get("theme_tags", []),
+                        layout_tokens=parsed.get("layout_tokens", []),
+                        layout_positions=parsed.get("layout_positions", []),
+                        layout_element_types=parsed.get("layout_element_types", []),
+                        layout_roles=parsed.get("layout_roles", []),
+                        top_k=int(num_results_txt),
+                        apply_meta_bonus=True,
+                        sort_by_base_sim=True,
+                    )
                     
                     # For UI presentation
                     base_pred = {
@@ -713,7 +734,16 @@ def render_search_page():
                         top_k=int(num_results_img),
                     )
                     base_pred = predict_base_zero_shot(image)
-                    base_res = engine.search_by_image(query_image=image, top_k=int(num_results_img))
+                    base_res = engine.search_by_image_guided(
+                        query_image=image,
+                        primary_screen_type=base_pred.get("primary_screen_type", ""),
+                        visual_style_tags=base_pred.get("visual_style_tags", []),
+                        theme_tags=base_pred.get("theme_tags", []),
+                        layout_roles=base_pred.get("layout_roles", []),
+                        top_k=int(num_results_img),
+                        apply_meta_bonus=True,
+                        sort_by_base_sim=True,
+                    )
                     show_results(fine_pred, fine_res, base_res, is_image=True, query_type="image")
 
 # ─────────────────────────────────────────────

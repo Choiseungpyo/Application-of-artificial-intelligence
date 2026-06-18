@@ -57,8 +57,10 @@ PRIMARY_SCREEN_MAPPING = {
 
     "quest": "gameplay_panel",
     "inventory": "gameplay_panel",
+    "equipment": "gameplay_panel",
     "character_screen": "gameplay_panel",
     "skill_tree": "gameplay_panel",
+    "crafting": "gameplay_panel",
     "gameplay_panel": "gameplay_panel",
 
     "gameplay_hud": "gameplay_hud",
@@ -369,9 +371,14 @@ class GameUISearchEngine:
             raise RuntimeError("Vector DB is not loaded.")
 
         file_name = self.cache_data["file_names"][idx]
+        game_title = self.cache_data["game_titles"][idx]
+        if not game_title or str(game_title).lower() == "unknown" or str(game_title) == "-":
+            base_name = os.path.splitext(file_name)[0]
+            game_title = base_name.replace("-", " ").replace("_", " ").title()
+
         return {
             "file_name": file_name,
-            "game_title": self.cache_data["game_titles"][idx],
+            "game_title": game_title,
             "score": float(score),
             "base_score": float(base_score if base_score is not None else score),
             "image_path": os.path.join(IMAGE_DIR, file_name),
@@ -408,7 +415,7 @@ class GameUISearchEngine:
         }
 
     def _encode_text(self, query_text: str) -> torch.Tensor:
-        text_inputs = self.processor(text=[query_text], padding="max_length", return_tensors="pt").to(self.device)
+        text_inputs = self.processor(text=[query_text], padding="max_length", truncation=True, max_length=64, return_tensors="pt").to(self.device)
         text_features = self.model.get_text_features(**text_inputs)
         text_features = getattr(text_features, "text_embeds", text_features)
         if not isinstance(text_features, torch.Tensor):
@@ -438,6 +445,8 @@ class GameUISearchEngine:
         layout_element_types: Optional[Sequence[str]] = None,
         layout_roles: Optional[Sequence[str]] = None,
         components: Optional[Sequence[str]] = None,
+        apply_meta_bonus: bool = True,
+        sort_by_base_sim: bool = False,
     ) -> List[Dict[str, Any]]:
         primary = safe_text(primary_screen_type)
         q_secondary = {normalize_label(x) for x in (secondary_screen_types or []) if safe_text(x)}
@@ -464,23 +473,31 @@ class GameUISearchEngine:
             # Group-based primary screen matching
             q_group = to_primary_group(primary)
             row_group = to_primary_group(row_primary)
-            primary_bonus = PRIMARY_SCREEN_BONUS if q_group and row_group and q_group == row_group else 0.0
-
-            secondary_match = bool(q_secondary.intersection(row_secondary))
-            secondary_bonus = SECONDARY_SCREEN_BONUS if secondary_match else 0.0
 
             row_v_styles = {normalize_label(x) for x in self._get_visual_style_tags(idx)}
             row_themes = {normalize_label(x) for x in self._get_theme_tags(idx)}
 
-            matched_v_styles = sorted(v_style_set.intersection(row_v_styles))
+            def to_style_group(style: str) -> str:
+                s = normalize_label(style)
+                if s in ["retro", "pixel", "pixel_art", "retro_pixel"]:
+                    return "retro_pixel"
+                if s in ["modern", "clean", "minimal", "flat", "modern_clean"]:
+                    return "modern_clean"
+                if s in ["realistic", "gritty", "realistic_gritty"]:
+                    return "realistic_gritty"
+                if s in ["cartoon", "stylized", "anime", "cute", "stylized_cartoon"]:
+                    return "stylized_cartoon"
+                return s
+
+            matched_v_styles = []
+            for rs in row_v_styles:
+                rs_group = to_style_group(rs)
+                if any(to_style_group(qs) == rs_group for qs in v_style_set):
+                    matched_v_styles.append(rs)
+                    
             matched_themes = sorted(theme_set.intersection(row_themes))
-            
-            style_bonus = min(STYLE_BONUS_MAX, STYLE_BONUS_PER_MATCH * len(matched_v_styles))
-            theme_bonus = min(THEME_BONUS_MAX, THEME_BONUS_PER_MATCH * len(matched_themes))
+            matched_layouts, _ = layout_token_match_score(query_layout_tokens, row_layout_tokens)
 
-            matched_layouts, layout_bonus = layout_token_match_score(query_layout_tokens, row_layout_tokens)
-
-            # New split axis bonuses
             q_pos_set = {normalize_label(x) for x in (layout_positions or []) if safe_text(x)}
             q_elem_set = {normalize_label(x) for x in (layout_element_types or []) if safe_text(x)}
             q_role_set = {normalize_label(x) for x in (layout_roles or []) if safe_text(x)}
@@ -488,18 +505,74 @@ class GameUISearchEngine:
             matched_pos = sorted(q_pos_set.intersection(row_layout_pos))
             matched_elem = sorted(q_elem_set.intersection(row_layout_elem))
             matched_role = sorted(q_role_set.intersection(row_layout_role))
-
-            split_bonus = min(LAYOUT_SPLIT_BONUS_MAX, 
-                              LAYOUT_POSITION_BONUS_PER_MATCH * len(matched_pos) +
-                              LAYOUT_ELEMENT_BONUS_PER_MATCH * len(matched_elem) +
-                              LAYOUT_ROLE_BONUS_PER_MATCH * len(matched_role))
-
             matched_components = sorted(component_set.intersection(row_components))
-            component_bonus = min(COMPONENT_BONUS_MAX, COMPONENT_BONUS_PER_MATCH * len(matched_components))
 
-            final_rank_score = base_sim + primary_bonus + secondary_bonus + style_bonus + theme_bonus + layout_bonus + split_bonus + component_bonus
-            display_score = max(0.0, min(100.0, final_rank_score * 100.0))
-            base_score = max(0.0, min(100.0, base_sim * 100.0))
+            # --- New Deduction-based Scoring System ---
+            max_meta = 0.0
+            achieved_meta = 0.0
+
+            if primary:
+                max_meta += 40.0
+                is_query_group_name = (primary in ["menu_lobby", "gameplay_panel", "gameplay_hud", "flow_other", "map_screen", "dialogue_story"])
+                
+                if primary == row_primary:
+                    achieved_meta += 40.0
+                elif is_query_group_name and q_group and row_group and q_group == row_group:
+                    achieved_meta += 40.0
+                elif q_group and row_group and q_group == row_group:
+                    achieved_meta += 20.0
+
+            if v_style_set:
+                max_meta += 30.0
+                if len(matched_v_styles) > 0:
+                    extra_tags = len(row_v_styles) - len(matched_v_styles)
+                    penalty = extra_tags * 5.0
+                    achieved_meta += max(0.0, 30.0 - penalty)
+
+            if theme_set:
+                max_meta += 20.0
+                if len(matched_themes) > 0:
+                    extra_tags = len(row_themes) - len(matched_themes)
+                    penalty = extra_tags * 3.0
+                    achieved_meta += max(0.0, 20.0 - penalty)
+
+            layout_provided = bool(query_layout_tokens or q_pos_set or q_elem_set or q_role_set or component_set)
+            if layout_provided:
+                max_meta += 10.0
+                has_layout_match = (
+                    len(matched_layouts) > 0 or 
+                    len(matched_pos) > 0 or 
+                    len(matched_elem) > 0 or 
+                    len(matched_role) > 0 or 
+                    len(matched_components) > 0
+                )
+                if has_layout_match:
+                    achieved_meta += 10.0
+
+            if max_meta > 0 and apply_meta_bonus:
+                meta_score = (achieved_meta / max_meta) * 100.0
+                norm_base = min(100.0, base_sim * 220.0) # Scale similarity naturally
+                display_score = (meta_score * 0.7) + (norm_base * 0.3)
+            else:
+                display_score = min(100.0, base_sim * 250.0)
+
+            # Cap scores
+            display_score = max(0.0, min(99.9, display_score))
+            base_score = max(0.0, min(99.9, base_sim * 250.0))
+            if sort_by_base_sim:
+                final_rank_score = base_sim
+            else:
+                final_rank_score = display_score / 100.0
+
+            secondary_match = bool(q_secondary.intersection(row_secondary))
+            
+            # Group-based match should also trigger UI highlight
+            primary_match = False
+            if primary:
+                if primary == row_primary:
+                    primary_match = True
+                elif q_group and row_group and q_group == row_group:
+                    primary_match = True
 
             ranked.append(
                 (
@@ -507,7 +580,7 @@ class GameUISearchEngine:
                     idx,
                     display_score,
                     base_score,
-                    bool(primary_bonus > 0.0),
+                    primary_match,
                     secondary_match,
                     matched_v_styles,
                     matched_themes,
@@ -520,7 +593,18 @@ class GameUISearchEngine:
             )
 
         ranked.sort(key=lambda x: x[0], reverse=True)
-        ranked = ranked[: min(top_k, len(ranked))]
+        
+        # 중복 이미지 제거 (file_name 기준)
+        dedup_ranked = []
+        seen_files = set()
+        for r in ranked:
+            file_name = self._get_text_value("file_names", r[1])
+            if file_name not in seen_files:
+                seen_files.add(file_name)
+                dedup_ranked.append(r)
+            if len(dedup_ranked) >= top_k:
+                break
+        ranked = dedup_ranked
 
         results: List[Dict[str, Any]] = []
         for _, idx, display_score, base_score, primary_match, secondary_match, m_v_styles, m_themes, m_layouts, m_pos, m_elem, m_role, m_components in ranked:
@@ -584,6 +668,8 @@ class GameUISearchEngine:
         layout_roles: Optional[Sequence[str]] = None,
         components: Optional[Sequence[str]] = None,
         top_k: int = 5,
+        apply_meta_bonus: bool = True,
+        sort_by_base_sim: bool = False,
     ) -> List[Dict[str, Any]]:
         if self.cache_data is None:
             return []
@@ -607,6 +693,8 @@ class GameUISearchEngine:
             layout_element_types=layout_element_types,
             layout_roles=layout_roles,
             components=components,
+            apply_meta_bonus=apply_meta_bonus,
+            sort_by_base_sim=sort_by_base_sim,
         )
 
     def search_by_filters(
@@ -649,6 +737,8 @@ class GameUISearchEngine:
         layout_roles: Optional[Sequence[str]] = None,
         components: Optional[Sequence[str]] = None,
         top_k: int = 5,
+        apply_meta_bonus: bool = True,
+        sort_by_base_sim: bool = False,
     ) -> List[Dict[str, Any]]:
         if self.cache_data is None:
             return []
@@ -672,6 +762,8 @@ class GameUISearchEngine:
             layout_element_types=layout_element_types,
             layout_roles=layout_roles,
             components=components,
+            apply_meta_bonus=apply_meta_bonus,
+            sort_by_base_sim=sort_by_base_sim,
         )
 
     def find_game_ui_set(self, query_image, top_k: int = 1) -> Dict[str, Dict[str, Any]]:
