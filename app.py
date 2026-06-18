@@ -27,6 +27,7 @@ from transformers import AutoModel, AutoProcessor
 
 from model import GameUIModel
 from search_engine import GameUISearchEngine, PRIMARY_SCREEN_MAPPING, normalize_label, to_primary_group
+from sketch_utils import draw_layout_sketch, generate_semantic_ui_sketch
 
 load_dotenv()
 try:
@@ -989,6 +990,33 @@ def predict_finetuned(image: Image.Image) -> Dict[str, Any]:
         }
 
 
+def predict_crop_finetuned(image: Image.Image) -> Tuple[str, str]:
+    if classifier_model is None or image is None:
+        return "panel_menu", "unknown"
+    try:
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+        with torch.inference_mode():
+            inputs = processor(images=image, return_tensors="pt")
+            pixel_values = inputs["pixel_values"].to(device)
+            outputs = classifier_model(pixel_values)
+            
+            # Predict top element type
+            elem_logits = outputs["logits_layout_element_types"][0]
+            top_elem_idx = int(torch.argmax(elem_logits).item())
+            elem_type = classifier_layout_element_types[top_elem_idx] if top_elem_idx < len(classifier_layout_element_types) else "panel_menu"
+            
+            # Predict top role
+            role_logits = outputs["logits_layout_roles"][0]
+            top_role_idx = int(torch.argmax(role_logits).item())
+            role = classifier_layout_roles[top_role_idx] if top_role_idx < len(classifier_layout_roles) else "unknown"
+            
+            return elem_type, role
+    except Exception as e:
+        print(f"[!] 크롭 이미지 예측 실패: {e}")
+        return "panel_menu", "unknown"
+
+
 def predict_base_zero_shot(image: Image.Image) -> Dict[str, Any]:
     primary_types, v_style_tags, theme_tags, layout_tokens = get_effective_label_space()
     if image is None:
@@ -1417,6 +1445,40 @@ def run_text_compare(query: str):
     elapsed      = time.time() - start
 
     return create_text_compare_html(parsed, guided_results, base_results, elapsed)
+
+
+def generate_sketch_from_text(text: str):
+    if not text or not text.strip():
+        return None
+    import re
+    tokens = [t.strip() for t in re.split(r'[,\n]+', text) if t.strip()]
+    return draw_layout_sketch(tokens)
+
+
+def generate_semantic_sketch_handler(image, text_tokens: str):
+    """Handler for Semantic UI Sketch tab (image + optional tokens)."""
+    if image is None:
+        return None
+    import re
+    tokens = None
+    # AI-based token extraction
+    pred = predict_finetuned(image)
+    positions = pred.get("layout_positions", [])
+    elements  = pred.get("layout_element_types", [])
+    roles     = pred.get("layout_roles", [])
+    max_len   = max(len(positions), len(elements), len(roles), 1)
+    ai_tokens = []
+    for i in range(max_len):
+        pos  = positions[i] if i < len(positions) else "center"
+        elem = elements[i]  if i < len(elements)  else "panel"
+        role = roles[i]     if i < len(roles)     else "unknown"
+        ai_tokens.append(f"{pos}:{elem}:{role}")
+    tokens = ai_tokens
+    # Add manual tokens if provided
+    if text_tokens and text_tokens.strip():
+        manual = [t.strip() for t in re.split(r'[,\n]+', text_tokens) if t.strip()]
+        tokens = tokens + manual
+    return generate_semantic_ui_sketch(image, layout_tokens=tokens)
 
 
 # ─────────────────────────────────────────────
@@ -2012,8 +2074,35 @@ with gr.Blocks(title="Game UI Discovery Studio") as demo:
                     value='<div class="empty-box" style="margin-top:16px;">이미지를 업로드하고 검색 버튼을 누르면 추천 결과가 표시됩니다.</div>'
                 )
 
+            # ── 레이아웃 스케치 탭 ──
+            with gr.Tab("🎨 레이아웃 스케치"):
+                with gr.Group():
+                    gr.HTML('''
+                    <div style="margin-bottom:12px; font-size:13px; color:#64748b; padding:12px;">
+                        UI 레이아웃 토큰을 쉼표(,) 또는 줄바꿈으로 구분하여 입력하면 와이어프레임(Blueprint) 형태의 스케치 이미지를 생성합니다.<br>
+                        예시:<br><code>top_left:health_bar:health<br>bottom_center:skill_bar:combat<br>right:panel:quest</code>
+                    </div>
+                    ''')
+                    with gr.Row():
+                        sketch_input = gr.Textbox(
+                            label="레이아웃 토큰 입력",
+                            placeholder="top_left:health_bar:health\nbottom_center:skill_bar:combat\nright:panel:quest",
+                            lines=5,
+                            scale=6,
+                        )
+                        sketch_btn = gr.Button("🎨 스케치 생성", variant="primary", scale=1)
+                
+                sketch_output_img = gr.Image(
+                    type="pil",
+                    label="레이아웃 스케치 결과",
+                    show_label=True,
+                    height=500,
+                    interactive=False
+                )
+
         txt_btn.click(run_text_compare,  inputs=[txt_input],  outputs=[txt_output_html])
         img_btn.click(run_image_compare, inputs=[img_input],  outputs=[img_output_html])
+        sketch_btn.click(generate_sketch_from_text, inputs=[sketch_input], outputs=[sketch_output_img])
 
     def show_main_page():
         return gr.update(visible=False), gr.update(visible=True)

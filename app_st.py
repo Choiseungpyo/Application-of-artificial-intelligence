@@ -7,6 +7,8 @@ import pandas as pd
 import re
 import sys
 
+from sketch_utils import generate_semantic_ui_sketch
+
 # ─────────────────────────────────────────────
 #  Page Config
 # ─────────────────────────────────────────────
@@ -160,6 +162,7 @@ def load_engine():
     return {
         "engine": app.engine,
         "predict_finetuned": app.predict_finetuned,
+        "predict_crop_finetuned": app.predict_crop_finetuned,
         "predict_base_zero_shot": app.predict_base_zero_shot,
         "interpret_text_query": app.interpret_text_query
     }
@@ -167,6 +170,7 @@ def load_engine():
 deps = load_engine()
 engine = deps["engine"]
 predict_finetuned = deps["predict_finetuned"]
+predict_crop_finetuned = deps["predict_crop_finetuned"]
 predict_base_zero_shot = deps["predict_base_zero_shot"]
 interpret_text_query = deps["interpret_text_query"]
 
@@ -561,7 +565,7 @@ def render_search_page():
 
     st.title("UI 추천 검색")
     
-    tab1, tab2 = st.tabs(["📝 텍스트 검색", "🖼️ 이미지 검색"])
+    tab1, tab2, tab3 = st.tabs(["📝 텍스트 검색", "🖼️ 이미지 검색", "🎨 레이아웃 스케치"])
     
     # ── 텍스트 검색 ──
     with tab1:
@@ -745,6 +749,100 @@ def render_search_page():
                         sort_by_base_sim=True,
                     )
                     show_results(fine_pred, fine_res, base_res, is_image=True, query_type="image")
+    # ── 레이아웃 스케치 ──
+    with tab3:
+        st.markdown("**게임 UI 이미지를 업로드하면, OpenCV 기반 UI 영역 검출과 스케치 변환을 결합한 Semantic UI Sketch를 생성합니다.**")
+        st.markdown("""
+        <div style="background:#f0f4ff; border-left:4px solid #2563eb; padding:12px 16px; border-radius:0 8px 8px 0; margin-bottom:16px; font-size:13px; color:#334155;">
+            <b>Semantic UI Sketch란?</b><br>
+            원본 이미지의 UI 구조(패널, 버튼, 바)를 컴퓨터 비전으로 검출하고,<br>
+            Auto Encoder 방식의 스케치 필터로 시각적 형태를 보존한 뒤,<br>
+            각 영역에 역할 라벨(Health, Skill, Map 등)을 자동 표시합니다.
+        </div>
+        """, unsafe_allow_html=True)
+
+        sketch_uploaded_file = st.file_uploader(
+            "게임 UI 이미지 업로드", type=["png", "jpg", "jpeg"], key="sketch_uploader"
+        )
+
+        if sketch_uploaded_file is not None:
+            sketch_image = Image.open(sketch_uploaded_file).convert("RGB")
+
+            use_ai = st.checkbox(
+                "🤖 AI 모델로 레이아웃 토큰 자동 추출 (Fine-tuned SigLIP2)",
+                value=True,
+                help="체크하면 학습된 분류 모델이 position/element/role 토큰을 예측하여 라벨링에 활용합니다.",
+            )
+
+            manual_tokens = st.text_area(
+                "✏️ 수동 레이아웃 토큰 입력 (선택, 쉼표 구분)",
+                placeholder="예: top_left:health_bar:health, bottom_center:skill_bar:combat, top_right:minimap:navigation",
+                height=80,
+            )
+
+            if st.button("🎨 Semantic UI Sketch 생성", type="primary", use_container_width=True):
+                with st.spinner("UI 영역 검출 및 스케치 생성 중..."):
+                    # ── Build layout tokens ──
+                    manual_list = []
+                    if manual_tokens and manual_tokens.strip():
+                        manual_list = [t.strip() for t in re.split(r'[,\n]+', manual_tokens) if t.strip()]
+
+                    # ── Generate ──
+                    crop_func = predict_crop_finetuned if use_ai else None
+                    result_img, detected_regions = generate_semantic_ui_sketch(
+                        sketch_image,
+                        layout_tokens=manual_list,
+                        crop_classifier_func=crop_func
+                    )
+
+                    # ── Display ──
+                    if use_ai and detected_regions:
+                        detected_tokens = []
+                        for r in detected_regions:
+                            pos = r.get("position_label", "center")
+                            elem = r.get("element_type", "panel")
+                            role = r.get("role", "unknown")
+                            detected_tokens.append(f"{pos}:{elem}:{role}")
+                        st.success(f"🤖 AI가 각 영역에서 검출한 레이아웃 토큰: {', '.join(detected_tokens)}")
+
+                    if manual_list:
+                        st.info(f"✏️ 적용된 사용자 수동 오버라이드 토큰: {', '.join(manual_list)}")
+
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.image(sketch_image, caption="원본 이미지", use_container_width=True)
+                    with col2:
+                        st.image(result_img, caption="Semantic UI Sketch", use_container_width=True)
+
+                    # ── Legend (웹 UI) ──
+                    if detected_regions:
+                        from sketch_utils import role_to_label_and_icon
+                        seen_roles = set()
+                        legend_items = []
+                        for r in detected_regions:
+                            role = r.get("role", "unknown")
+                            if role not in seen_roles:
+                                seen_roles.add(role)
+                                label, tag, color = role_to_label_and_icon(role)
+                                legend_items.append((tag, label, color, r["position_label"]))
+
+                        legend_html = '<div style="margin-top:16px; padding:16px 20px; background:#ffffff; border:1px solid #e2e8f0; border-radius:12px;">'
+                        legend_html += '<div style="font-size:13px; font-weight:800; color:#334155; margin-bottom:12px;">🏷️ 검출된 UI 영역 역할</div>'
+                        legend_html += '<div style="display:flex; flex-wrap:wrap; gap:10px;">'
+                        for tag, label, color, pos in legend_items:
+                            r, g, b = color
+                            legend_html += f'''
+                            <div style="display:flex; align-items:center; gap:8px; padding:6px 14px;
+                                        background:rgba({r},{g},{b},0.08); border:1.5px solid rgba({r},{g},{b},0.3);
+                                        border-radius:999px; font-size:12px;">
+                                <span style="width:10px; height:10px; border-radius:50%;
+                                             background:rgb({r},{g},{b}); display:inline-block;"></span>
+                                <span style="font-weight:800; color:rgb({r},{g},{b});">[{tag}]</span>
+                                <span style="font-weight:600; color:#334155;">{label}</span>
+                                <span style="font-size:10px; color:#94a3b8;">({pos})</span>
+                            </div>'''
+                        legend_html += '</div></div>'
+                        st.markdown(legend_html, unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────
 #  Routing
